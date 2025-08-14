@@ -1,0 +1,528 @@
+⌨️ API
+Before using the CustomFishing API, make sure you have imported the Paper API.
+
+Logo
+Paper Project Setup | PaperMC Docs
+Then you can add the CustomFishing API dependency to your project
+
+📌 Repository
+Copy
+repositories {
+    maven("https://repo.momirealms.net/releases/")
+}
+📌 Dependency
+Copy
+dependencies {
+    compileOnly("net.momirealms:custom-fishing:{version}")
+}
+At last, don't forget to add CustomFishing to plugin.yml
+
+Copy
+depend:
+  - CustomFishing
+
+Events
+Available events can be found on
+
+Logo
+Custom-Fishing/api/src/main/java/net/momirealms/customfishing/api/event at main · Xiao-MoMi/Custom-Fishing
+
+Basic Operations
+Create context
+Copy
+Player player = Bukkit.getPlayer("player");
+Context<Player> context = Context.player(player);
+// You can create it with null, but please be careful not to use it in any place 
+// where a player is needed, such as checking permissions, sending messages
+Context<Player> context = Context.player(null);
+Get plugin instance
+Copy
+BukkitCustomFishingPlugin api = BukkitCustomFishingPlugin.getInstance()
+Build an item instance
+Copy
+ItemStack itemStack = api.getItemManager().buildInternal(context, "rubbish");
+Get effect modifier
+Copy
+Optional<EffectModifier> optional = api.getEffectManager().getEffectModifier("beginner_rod", MechanicType.ROD);
+if (optional.isPresent()) {
+    EffectModifier modifier = optional.get();
+}
+Create new effect instance
+Copy
+Effect effect = Effect.newInstance();
+Apply the modifier
+Copy
+// There are three stages in total
+// CAST: Determines what fishing mechanics are available (such as lava fishing)
+// LOOT: Affects the weight of the next loot
+// FISHING: Determines loot-related properties, such as size, score, and game difficulty
+modifier.apply(effect, FishingEffectApplyEvent.Stage.CAST, context);
+Get the loot at a certain location
+Copy
+context.arg(ContextKeys.LOCATION, player.getLocation()); // sets the player location
+context.arg(ContextKeys.OTHER_LOCATION, custom_location); // sets the custom location, in most cases, it's the hook's
+context.arg(ContextKeys.SURROUNDING, "water");
+Loot loot = api.getLootManager().getNextLoot(effect, context); 
+Convert loot into an itemStack
+Copy
+if (loot.type() == LootType.ITEM) {
+    ItemStack itemStack = api.getItemManager().buildInternal(context, loot.id());
+}
+Get the itemStack from FishingLootSpawnEvent
+Copy
+@EventHandler
+public void onLootSpawn(FishingLootSpawnEvent event) {
+    if (event.getEntity() instanceof Item item) {
+        ItemStack itemStack = item.getItemStack();
+    }
+}
+
+Integration Provider
+You can register providers for items, creatures, enchantments, etc. for plugins to use. You only need to implement the interface with the corresponding parameters and finally reload the plugin to apply it.
+
+Copy
+BukkitCustomFishingPlugin api = BukkitCustomFishingPlugin.getInstance();
+api.getIntegrationManager().registerBlockProvider(...);
+api.getIntegrationManager().registerEnchantmentProvider(...);
+api.getIntegrationManager().registerEntityProvider(...);
+api.getIntegrationManager().registerSeasonProvider(...);
+api.getIntegrationManager().registerLevelerProvider(...);
+api.getIntegrationManager().registerItemProvider(...);
+api.reload();
+
+Custom Hook Logics
+To override the system that comes with the plugin, just follow the steps below. As long as interface(HookMechanic) is implemented and added to the list of available mechanisms, the custom logics can start working (note: the order of addition affects the priority of mechanism judgment)
+
+Copy
+CustomFishingHook.mechanicProviders((h, c, e) -> {
+    ArrayList<HookMechanic> mechanics = new ArrayList<>();
+    mechanics.add(new VanillaMechanic(h, c));
+    mechanics.add(new LavaFishingMechanic(h, e, c));
+    return mechanics;
+});
+Copy
+package net.momirealms.customfishing.api.mechanic.fishing.hook;
+
+import net.momirealms.customfishing.api.BukkitCustomFishingPlugin;
+import net.momirealms.customfishing.api.event.FishingHookStateEvent;
+import net.momirealms.customfishing.api.mechanic.config.ConfigManager;
+import net.momirealms.customfishing.api.mechanic.context.Context;
+import net.momirealms.customfishing.api.mechanic.context.ContextKeys;
+import net.momirealms.customfishing.api.mechanic.effect.Effect;
+import net.momirealms.customfishing.api.mechanic.effect.EffectProperties;
+import net.momirealms.customfishing.api.util.EventUtils;
+import net.momirealms.customfishing.common.plugin.scheduler.SchedulerTask;
+import net.momirealms.customfishing.common.util.RandomUtils;
+import net.momirealms.sparrow.heart.SparrowHeart;
+import net.momirealms.sparrow.heart.feature.fluid.FluidData;
+import org.bukkit.*;
+import org.bukkit.block.BlockFace;
+import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.FishHook;
+import org.bukkit.entity.Player;
+import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.util.Vector;
+
+import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class LavaFishingMechanic implements HookMechanic {
+
+    private final FishHook hook;
+    private final Effect gearsEffect;
+    private final Context<Player> context;
+    private ArmorStand tempEntity;
+    private SchedulerTask task;
+    private int timeUntilLured;
+    private int timeUntilHooked;
+    private int nibble;
+    private boolean hooked;
+    private float fishAngle;
+    private int currentState;
+    private int jumpTimer;
+    private boolean firstTime = true;
+    private boolean freeze = false;
+
+    public LavaFishingMechanic(FishHook hook, Effect gearsEffect, Context<Player> context) {
+        this.hook = hook;
+        this.gearsEffect = gearsEffect;
+        this.context = context;
+    }
+
+    @Override
+    public boolean canStart() {
+        if (!(boolean) gearsEffect.properties().getOrDefault(EffectProperties.LAVA_FISHING, false)) {
+            return false;
+        }
+        if (hook.isInLava()) {
+            return true;
+        }
+        float lavaHeight = 0F;
+        Location location = this.hook.getLocation();
+        FluidData fluidData = SparrowHeart.getInstance().getFluidData(location);
+        if (fluidData.getFluidType() == Fluid.LAVA || fluidData.getFluidType() == Fluid.FLOWING_LAVA) {
+            lavaHeight = (float) (fluidData.getLevel() * 0.125);
+        }
+        return lavaHeight > 0 && location.getY() % 1 <= lavaHeight;
+    }
+
+    @Override
+    public boolean shouldStop() {
+        if (hook.isInLava()) {
+            return false;
+        }
+        return hook.isOnGround() || (hook.getLocation().getBlock().getType() != Material.LAVA && hook.getLocation().getBlock().getRelative(BlockFace.DOWN).getType() != Material.LAVA);
+    }
+
+    @Override
+    public void preStart() {
+        this.context.arg(ContextKeys.SURROUNDING, EffectProperties.LAVA_FISHING.key());
+    }
+
+    @Override
+    public void start(Effect finalEffect) {
+        EventUtils.fireAndForget(new FishingHookStateEvent(context.holder(), hook, FishingHookStateEvent.State.LAND));
+        this.setWaitTime(finalEffect);
+        this.task = BukkitCustomFishingPlugin.getInstance().getScheduler().sync().runRepeating(() -> {
+            Location location = this.hook.getLocation();
+            float lavaHeight = 0F;
+            FluidData fluidData = SparrowHeart.getInstance().getFluidData(location);
+            if (fluidData.getFluidType() == Fluid.LAVA || fluidData.getFluidType() == Fluid.FLOWING_LAVA) {
+                lavaHeight = (float) (fluidData.getLevel() * 0.125);
+            }
+            if (this.nibble > 0) {
+                --this.nibble;
+                if (location.getY() % 1 <= lavaHeight) {
+                    this.jumpTimer++;
+                    if (this.jumpTimer >= 4) {
+                        this.jumpTimer = 0;
+                        this.hook.setVelocity(new Vector(0,0.24,0));
+                    }
+                }
+                if (this.nibble <= 0) {
+                    this.timeUntilLured = 0;
+                    this.timeUntilHooked = 0;
+                    this.hooked = false;
+                    this.jumpTimer = 0;
+                    this.currentState = 0;
+                }
+            } else {
+                double hookY = location.getY();
+                if (hookY < 0) {
+                    hookY += Math.abs(Math.floor(hookY));
+                }
+                if (hookY % 1 <= lavaHeight || this.hook.isInLava()) {
+                    Vector previousVector = this.hook.getVelocity();
+                    this.hook.setVelocity(new Vector(previousVector.getX() * 0.6, Math.min(0.1, Math.max(-0.1, previousVector.getY() + 0.07)), previousVector.getZ() * 0.6));
+                    this.currentState = 1;
+                } else {
+                    if (currentState == 1) {
+                        this.currentState = 0;
+                        // set temp entity
+                        this.tempEntity = this.hook.getWorld().spawn(location.clone().subtract(0,1,0), ArmorStand.class);
+                        this.setTempEntityProperties(this.tempEntity);
+                        this.hook.setHookedEntity(this.tempEntity);
+                        if (!firstTime) {
+                            EventUtils.fireAndForget(new FishingHookStateEvent(context.holder(), hook, FishingHookStateEvent.State.ESCAPE));
+                        }
+                        firstTime = false;
+                    }
+                }
+                float f;
+                float f1;
+                float f2;
+                double d0;
+                double d1;
+                double d2;
+                if (this.timeUntilHooked > 0) {
+                    this.timeUntilHooked -= 1;
+                    if (this.timeUntilHooked > 0) {
+                        this.fishAngle += (float) RandomUtils.triangle(0.0D, 9.188D);
+                        f = this.fishAngle * 0.017453292F;
+                        f1 = (float) Math.sin(f);
+                        f2 = (float) Math.cos(f);
+                        d0 = location.getX() + (double) (f1 * (float) this.timeUntilHooked * 0.1F);
+                        d1 = location.getY();
+                        d2 = location.getZ() + (double) (f2 * (float) this.timeUntilHooked * 0.1F);
+                        if (RandomUtils.generateRandomFloat(0,1) < 0.15F) {
+                            hook.getWorld().spawnParticle(Particle.FLAME, d0, d1 - 0.10000000149011612D, d2, 1, f1, 0.1D, f2, 0.0D);
+                        }
+                        float f3 = f1 * 0.04F;
+                        float f4 = f2 * 0.04F;
+                        hook.getWorld().spawnParticle(Particle.FLAME, d0, d1, d2, 0, f4, 0.01D, -f3, 1.0D);
+                    } else {
+                        double d3 = location.getY() + 0.5D;
+                        hook.getWorld().spawnParticle(Particle.FLAME, location.getX(), d3, location.getZ(), (int) (1.0F + 0.3 * 20.0F), 0.3, 0.0D, 0.3, 0.20000000298023224D);
+                        this.nibble = RandomUtils.generateRandomInt(20, 40);
+                        this.hooked = true;
+                        hook.getWorld().playSound(location, Sound.ENTITY_GENERIC_EXTINGUISH_FIRE, 0.25F, 1.0F + (RandomUtils.generateRandomFloat(0,1)-RandomUtils.generateRandomFloat(0,1)) * 0.4F);
+                        EventUtils.fireAndForget(new FishingHookStateEvent(context.holder(), hook, FishingHookStateEvent.State.BITE));
+                        if (this.tempEntity != null && this.tempEntity.isValid()) {
+                            this.tempEntity.remove();
+                        }
+                    }
+                } else if (timeUntilLured > 0) {
+                    if (!freeze) {
+                        timeUntilLured--;
+                    }
+                    if (this.timeUntilLured <= 0) {
+                        this.fishAngle = RandomUtils.generateRandomFloat(0F, 360F);
+                        this.timeUntilHooked = RandomUtils.generateRandomInt(20, 80);
+                        EventUtils.fireAndForget(new FishingHookStateEvent(context.holder(), hook, FishingHookStateEvent.State.LURE));
+                    }
+                } else {
+                    setWaitTime(finalEffect);
+                }
+            }
+        }, 1, 1, hook.getLocation());
+    }
+
+    @Override
+    public boolean isHooked() {
+        return hooked;
+    }
+
+    @Override
+    public void destroy() {
+        if (this.tempEntity != null && this.tempEntity.isValid()) {
+            this.tempEntity.remove();
+        }
+        if (this.task != null) {
+            this.task.cancel();
+        }
+        freeze = false;
+    }
+
+    @Override
+    public void freeze() {
+        freeze = true;
+    }
+
+    @Override
+    public void unfreeze(Effect effect) {
+        freeze = false;
+    }
+
+    private void setWaitTime(Effect effect) {
+        int before = ThreadLocalRandom.current().nextInt(ConfigManager.lavaMaxTime() - ConfigManager.lavaMinTime() + 1) + ConfigManager.lavaMinTime();
+        int after = Math.max(ConfigManager.lavaMinTime(), (int) (before * effect.waitTimeMultiplier() + effect.waitTimeAdder()));
+        BukkitCustomFishingPlugin.getInstance().debug("Wait time: " + before + " -> " + after + " ticks");
+        this.timeUntilLured = after;
+    }
+
+    private void setTempEntityProperties(ArmorStand entity) {
+        entity.setInvisible(true);
+        entity.setCollidable(false);
+        entity.setInvulnerable(true);
+        entity.setVisible(false);
+        entity.setCustomNameVisible(false);
+        entity.setSmall(true);
+        entity.setGravity(false);
+        entity.getPersistentDataContainer().set(
+                Objects.requireNonNull(NamespacedKey.fromString("temp-entity", BukkitCustomFishingPlugin.getInstance().getBootstrap())),
+                PersistentDataType.STRING,
+                "lava"
+        );
+    }
+}
+
+BukkitCustomFishingPlugin.getInstance().getGameManager().registerGameType("accurate_click_v2", ((id, section) -> {
+    GameBasics basics = getGameBasics(section);
+    return new AbstractGame(id, basics) {
+
+        private final String barWidth = section.getString("title.total-width", "15~20");
+        private final String barSuccess = section.getString("title.success-width","3~4");
+        private final String barBody = section.getString("title.body","");
+        private final String left = section.getString("title.left","");
+        private final String right = section.getString("title.right","");
+        private final String barPointer = section.getString("title.pointer", "");
+        private final String barTarget = section.getString("title.target","");
+        private final String subtitle = section.getString("subtitle", "<gray>Reel in at the most critical moment</gray>");
+
+        @Override
+        public BiFunction<CustomFishingHook, GameSetting, AbstractGamingPlayer> gamingPlayerProvider() {
+
+            int minWidth = Integer.parseInt(barWidth.split("~")[0]);
+            int maxWidth = Integer.parseInt(barWidth.split("~")[1]);
+            int minSuccess = Integer.parseInt(barSuccess.split("~")[0]);
+            int maxSuccess = Integer.parseInt(barSuccess.split("~")[1]);
+
+            return (customFishingHook, gameSetting) -> new AbstractGamingPlayer(customFishingHook, gameSetting) {
+
+                private final int totalWidth = RandomUtils.generateRandomInt(minWidth, maxWidth);
+                private final int successWidth = RandomUtils.generateRandomInt(minSuccess, maxSuccess);
+                private final int successPosition = ThreadLocalRandom.current().nextInt((totalWidth - successWidth + 1)) + 1;
+                private int currentIndex = 0;
+                private int timer = 0;
+                private boolean face = true;
+
+                @Override
+                protected void tick() {
+                    timer++;
+                    if (timer % ((106 - (int) settings.difficulty()) / 5) == 0) {
+                        movePointer();
+                    }
+                    showUI();
+                }
+
+                private void movePointer() {
+                    if (face) {
+                        currentIndex++;
+                        if (currentIndex >= totalWidth - 1) {
+                            face = false;
+                        }
+                    } else {
+                        currentIndex--;
+                        if (currentIndex <= 0) {
+                            face = true;
+                        }
+                    }
+                }
+
+                private void showUI() {
+                    StringBuilder stringBuilder = new StringBuilder();
+                    for (int i = 1; i <= totalWidth; i++) {
+                        if (i == currentIndex + 1) {
+                            stringBuilder.append(barPointer);
+                            continue;
+                        }
+                        if (i >= successPosition && i <= successPosition + successWidth - 1) {
+                            stringBuilder.append(barTarget);
+                            continue;
+                        }
+                        stringBuilder.append(barBody);
+                    }
+
+                    SparrowHeart.getInstance().sendTitle(getPlayer(), AdventureHelper.miniMessageToJson(left + stringBuilder + right), AdventureHelper.miniMessageToJson(subtitle), 0, 20, 0);
+                }
+
+                @Override
+                public boolean isSuccessful() {
+                    if (isTimeOut) return false;
+                    return currentIndex + 1 <= successPosition + successWidth - 1 && currentIndex + 1 >= successPosition;
+                }
+            };
+        }
+    };
+}));
+Using an expansion jar
+Copy
+package net.momirealms.customfishing.api;
+
+import dev.dejvokep.boostedyaml.block.implementation.Section;
+import net.momirealms.customfishing.api.mechanic.fishing.CustomFishingHook;
+import net.momirealms.customfishing.api.mechanic.game.*;
+import net.momirealms.customfishing.api.mechanic.misc.value.MathValue;
+import net.momirealms.customfishing.common.helper.AdventureHelper;
+import net.momirealms.customfishing.common.util.RandomUtils;
+import net.momirealms.sparrow.heart.SparrowHeart;
+
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BiFunction;
+
+public class CustomGameFactory extends GameExpansion {
+    @Override
+    public String getVersion() {
+        return "1.0";
+    }
+
+    @Override
+    public String getAuthor() {
+        return "XiaoMoMi";
+    }
+
+    @Override
+    public String getGameType() {
+        return "accurate_click_v2";
+    }
+
+    @Override
+    public GameFactory getGameFactory() {
+        return ((id, section) -> {
+            GameBasics basics = getGameBasics(section);
+            return new AbstractGame(id, basics) {
+
+                private final String barWidth = section.getString("title.total-width", "15~20");
+                private final String barSuccess = section.getString("title.success-width","3~4");
+                private final String barBody = section.getString("title.body","");
+                private final String left = section.getString("title.left","");
+                private final String right = section.getString("title.right","");
+                private final String barPointer = section.getString("title.pointer", "");
+                private final String barTarget = section.getString("title.target","");
+                private final String subtitle = section.getString("subtitle", "<gray>Reel in at the most critical moment</gray>");
+
+                @Override
+                public BiFunction<CustomFishingHook, GameSetting, AbstractGamingPlayer> gamingPlayerProvider() {
+
+                    int minWidth = Integer.parseInt(barWidth.split("~")[0]);
+                    int maxWidth = Integer.parseInt(barWidth.split("~")[1]);
+                    int minSuccess = Integer.parseInt(barSuccess.split("~")[0]);
+                    int maxSuccess = Integer.parseInt(barSuccess.split("~")[1]);
+
+                    return (customFishingHook, gameSetting) -> new AbstractGamingPlayer(customFishingHook, gameSetting) {
+
+                        private final int totalWidth = RandomUtils.generateRandomInt(minWidth, maxWidth);
+                        private final int successWidth = RandomUtils.generateRandomInt(minSuccess, maxSuccess);
+                        private final int successPosition = ThreadLocalRandom.current().nextInt((totalWidth - successWidth + 1)) + 1;
+                        private int currentIndex = 0;
+                        private int timer = 0;
+                        private boolean face = true;
+
+                        @Override
+                        protected void tick() {
+                            timer++;
+                            if (timer % ((106 - (int) settings.difficulty()) / 5) == 0) {
+                                movePointer();
+                            }
+                            showUI();
+                        }
+
+                        private void movePointer() {
+                            if (face) {
+                                currentIndex++;
+                                if (currentIndex >= totalWidth - 1) {
+                                    face = false;
+                                }
+                            } else {
+                                currentIndex--;
+                                if (currentIndex <= 0) {
+                                    face = true;
+                                }
+                            }
+                        }
+
+                        private void showUI() {
+                            StringBuilder stringBuilder = new StringBuilder();
+                            for (int i = 1; i <= totalWidth; i++) {
+                                if (i == currentIndex + 1) {
+                                    stringBuilder.append(barPointer);
+                                    continue;
+                                }
+                                if (i >= successPosition && i <= successPosition + successWidth - 1) {
+                                    stringBuilder.append(barTarget);
+                                    continue;
+                                }
+                                stringBuilder.append(barBody);
+                            }
+
+                            SparrowHeart.getInstance().sendTitle(getPlayer(), AdventureHelper.miniMessageToJson(left + stringBuilder + right), AdventureHelper.miniMessageToJson(subtitle), 0, 20, 0);
+                        }
+
+                        @Override
+                        public boolean isSuccessful() {
+                            if (isTimeOut) return false;
+                            return currentIndex + 1 <= successPosition + successWidth - 1 && currentIndex + 1 >= successPosition;
+                        }
+                    };
+                }
+            };
+        });
+    }
+
+    private GameBasics getGameBasics(Section section) {
+        return GameBasics.builder()
+                .difficulty(MathValue.auto(section.get("difficulty", "20~80"), false))
+                .time(MathValue.auto(section.get("time", 15), false))
+                .build();
+    }
+}
